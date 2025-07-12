@@ -82,7 +82,7 @@ LineRenderer:
   m_RenderingLayerMask: 1
   m_RendererPriority: 0
   m_Materials:
-  - {fileID: 0}
+  - {fileID: 2100000, guid: 55d5a158244a64a45bef4c7fb832acd7, type: 2}
   m_StaticBatchInfo:
     firstSubMesh: 0
     subMeshCount: 0
@@ -346,6 +346,12 @@ MonoBehaviour:
   angularDrag: 4
   maxVelocity: 10
   useContinuousCollision: 1
+  positionThreshold: 0.001
+  rotationThreshold: 0.1
+  scaleThreshold: 0.001
+  staticVelocityDamping: 0.1
+  minimumMovementThreshold: 0.05
+  enablePredictiveMovement: 1
 --- !u!114 &5618088356209656888
 MonoBehaviour:
   m_ObjectHideFlags: 0
