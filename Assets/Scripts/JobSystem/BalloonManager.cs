@@ -13,7 +13,7 @@ namespace BalloonSimulation.JobSystem
     {
         [Header("Simulation Settings")]
         [SerializeField] private int balloonCount = 1000;
-        [SerializeField] private SimulationParameters simulationParameters;
+        [SerializeField] public SimulationParameters simulationParameters;
         
         [Header("Rendering")]
         [SerializeField] private Material balloonMaterial;
@@ -28,6 +28,7 @@ namespace BalloonSimulation.JobSystem
         private NativeArray<float3> velocityDeltas;
         private NativeParallelMultiHashMap<int, int> spatialHash;
         private NativeList<CollisionPair> collisionPairs;
+        private NativeArray<SceneColliderData> sceneColliders;
         
         // Systems
         private BalloonRenderingSystem renderingSystem;
@@ -61,6 +62,9 @@ namespace BalloonSimulation.JobSystem
                 simulationParameters = SimulationParameters.CreateDefault();
             }
             
+            // Collect scene colliders
+            CollectSceneColliders();
+            
             // Create balloon mesh if not assigned
             if (balloonMesh == null)
             {
@@ -88,6 +92,50 @@ namespace BalloonSimulation.JobSystem
             renderingSystem.UpdateBounds(simulationParameters.worldBounds);
         }
         
+        void CollectSceneColliders()
+        {
+            var collidersList = new System.Collections.Generic.List<SceneColliderData>();
+            
+            // Find all colliders in the scene
+            Collider[] allColliders = FindObjectsOfType<Collider>();
+            
+            foreach (var collider in allColliders)
+            {
+                // Skip balloon objects, triggers, and inactive objects
+                if (collider.isTrigger || collider.gameObject == gameObject || !collider.enabled || !collider.gameObject.activeInHierarchy)
+                    continue;
+                
+                // Convert Unity colliders to job-friendly data
+                if (collider is BoxCollider box)
+                {
+                    collidersList.Add(SceneColliderData.FromBoxCollider(box));
+                }
+                else if (collider is SphereCollider sphere)
+                {
+                    collidersList.Add(SceneColliderData.FromSphereCollider(sphere));
+                }
+                else if (collider is CapsuleCollider capsule)
+                {
+                    collidersList.Add(SceneColliderData.FromCapsuleCollider(capsule));
+                }
+            }
+            
+            // Only reallocate if size changed
+            if (!sceneColliders.IsCreated || sceneColliders.Length != collidersList.Count)
+            {
+                if (sceneColliders.IsCreated)
+                    sceneColliders.Dispose();
+                    
+                sceneColliders = new NativeArray<SceneColliderData>(collidersList.Count, Allocator.Persistent);
+            }
+            
+            // Update collider data
+            for (int i = 0; i < collidersList.Count; i++)
+            {
+                sceneColliders[i] = collidersList[i];
+            }
+        }
+        
         void InitializeBalloons()
         {
             float3 spawnMin = new float3(simulationParameters.worldBounds.min.x,
@@ -102,10 +150,29 @@ namespace BalloonSimulation.JobSystem
                 // Random spawn position
                 float3 position = random.NextFloat3(spawnMin, spawnMax);
                 
-                // Random balloon properties
-                float radius = random.NextFloat(0.3f, 0.5f);
-                float mass = random.NextFloat(0.003f, 0.007f); // 3-7 grams
-                float buoyancy = random.NextFloat(0.012f, 0.018f); // Buoyancy factor
+                // Random balloon properties with realistic values
+                float radius, mass, buoyancy;
+                
+                // Use preset values with variation
+                float balloonType = random.NextFloat(0f, 100f);
+                if (balloonType < 20f) // 20% small balloons
+                {
+                    radius = random.NextFloat(0.2f, 0.3f);
+                    mass = random.NextFloat(0.002f, 0.003f);
+                    buoyancy = random.NextFloat(0.017f, 0.019f);
+                }
+                else if (balloonType < 30f) // 10% large balloons
+                {
+                    radius = random.NextFloat(0.5f, 0.7f);
+                    mass = random.NextFloat(0.007f, 0.010f);
+                    buoyancy = random.NextFloat(0.013f, 0.015f);
+                }
+                else // 70% standard balloons
+                {
+                    radius = random.NextFloat(0.35f, 0.45f);
+                    mass = random.NextFloat(0.003f, 0.005f);
+                    buoyancy = random.NextFloat(0.015f, 0.017f);
+                }
                 
                 // Random color
                 float4 color = new float4(
@@ -143,6 +210,9 @@ namespace BalloonSimulation.JobSystem
             
             // Complete previous frame's jobs
             CompleteJobs();
+            
+            // Update scene colliders after jobs are complete
+            CollectSceneColliders();
             
             // Schedule spatial hash rebuild
             var buildHashJob = new BuildSpatialHashJob
@@ -198,7 +268,17 @@ namespace BalloonSimulation.JobSystem
                 velocityDeltas = velocityDeltas,
                 maxVelocity = maxVelocity
             };
-            collisionJobHandle = applyDeltasJob.Schedule(balloonCount, innerLoopBatchCount, collisionHandle);
+            var applyHandle = applyDeltasJob.Schedule(balloonCount, innerLoopBatchCount, collisionHandle);
+            
+            // Schedule scene collision job
+            var sceneCollisionJob = new BalloonSceneCollisionJob
+            {
+                balloons = balloons,
+                sceneColliders = sceneColliders,
+                parameters = simulationParameters,
+                deltaTime = deltaTime
+            };
+            collisionJobHandle = sceneCollisionJob.Schedule(balloonCount, innerLoopBatchCount, applyHandle);
             
             // Schedule completion for rendering
             JobHandle.ScheduleBatchedJobs();
@@ -246,6 +326,7 @@ namespace BalloonSimulation.JobSystem
             {
                 ChangeBalloonCount(Mathf.Max(balloonCount - 500, 100));
             }
+            
         }
         
         void ResetSimulation()
@@ -266,6 +347,7 @@ namespace BalloonSimulation.JobSystem
             velocityDeltas.Dispose();
             spatialHash.Dispose();
             collisionPairs.Dispose();
+            sceneColliders.Dispose();
             
             // Update count and reinitialize
             balloonCount = newCount;
@@ -273,6 +355,7 @@ namespace BalloonSimulation.JobSystem
             
             Debug.Log($"Balloon count changed to: {balloonCount}");
         }
+        
         
         void UpdatePerformanceMetrics()
         {
@@ -304,7 +387,8 @@ namespace BalloonSimulation.JobSystem
                    $"Controls:\n" +
                    $"  R - Reset\n" +
                    $"  W - Toggle Wind\n" +
-                   $"  +/- Change Count";
+                   $"  +/- Change Count\n" +
+                   $"Scene Colliders: {(sceneColliders.IsCreated ? sceneColliders.Length : 0)}";
         }
         
         void OnDestroy()
@@ -316,6 +400,7 @@ namespace BalloonSimulation.JobSystem
             if (velocityDeltas.IsCreated) velocityDeltas.Dispose();
             if (spatialHash.IsCreated) spatialHash.Dispose();
             if (collisionPairs.IsCreated) collisionPairs.Dispose();
+            if (sceneColliders.IsCreated) sceneColliders.Dispose();
             
             // Dispose rendering system
             renderingSystem?.Dispose();

@@ -247,16 +247,16 @@ MonoBehaviour:
   balloonCount: 10
   simulationParameters:
     gravity: 9.81
-    airDensity: 1.225
-    windStrength: 0
+    airDensity: 5.86
+    windStrength: 1.5
     windDirection:
       x: 0
       y: 0
       z: 0
-    damping: 0
-    collisionElasticity: 0.8
+    damping: 0.47
+    collisionElasticity: 0.6
     worldBounds:
-      m_Center: {x: 0, y: 3, z: 0}
+      m_Center: {x: 0, y: 10, z: 0}
       m_Extent: {x: 3, y: 3, z: 3}
   balloonMaterial: {fileID: 2100000, guid: d882d488d75fb9a49acb5beb3485cbee, type: 2}
   balloonMesh: {fileID: 10207, guid: 0000000000000000e000000000000000, type: 0}
