@@ -1,0 +1,530 @@
+#pragma kernel UpdatePhysics
+#pragma kernel UpdateDeformation
+#pragma kernel UpdateFluidDynamics
+#pragma kernel UpdateSwarmBehavior
+#pragma kernel UpdateTransformMatrices
+
+// Constants
+#define THREAD_GROUP_SIZE 64
+#define MAX_NEIGHBORS 32
+#define PI 3.14159265359
+#define GRAVITY -9.81
+
+// Balloon data structure (must match C# EnhancedBalloonData)
+struct BalloonData
+{
+    // Basic physics
+    float3 position;
+    float3 velocity;
+    float3 acceleration;
+    float4 rotation;
+    float3 angularVelocity;
+    
+    // Shape and material
+    float radius;
+    float mass;
+    float buoyancy;
+    float elasticity;
+    float viscosity;
+    
+    // Deformation
+    float4x4 deformationMatrix;
+    float surfaceTension;
+    float internalPressure;
+    
+    // Visual
+    float4 baseColor;
+    float metallic;
+    float roughness;
+    float transparency;
+    float4x4 transformMatrix;
+    
+    // State
+    int state; // 0=Normal, 1=Deforming, 2=Bursting, 3=Destroyed
+    float health;
+    float age;
+    
+    // LOD
+    int lodLevel;
+    float distanceToCamera;
+};
+
+// Simulation parameters
+struct SimulationParams
+{
+    float gravity;
+    float airDensity;
+    float windStrength;
+    float3 windDirection;
+    float damping;
+    float collisionElasticity;
+    float3 worldBoundsMin;
+    float3 worldBoundsMax;
+    
+    float viscosityCoefficient;
+    float dragCoefficient;
+    float turbulenceStrength;
+    float vortexStrength;
+    
+    float temperature;
+    float altitude;
+    float humidity;
+    
+    int maxBalloonCount;
+    float physicsTimeStep;
+    float lodDistanceThreshold;
+    float deltaTime;
+    float time;
+    
+    float3 cameraPosition;
+};
+
+// Buffers
+RWStructuredBuffer<BalloonData> _BalloonBuffer;
+RWStructuredBuffer<int> _ActiveIndicesBuffer;
+RWStructuredBuffer<float4x4> _TransformBuffer;
+RWStructuredBuffer<float4> _ColorBuffer;
+RWStructuredBuffer<float4> _MaterialPropertyBuffer;
+
+StructuredBuffer<float3> _VelocityField;
+StructuredBuffer<float> _PressureField;
+StructuredBuffer<float> _DensityField;
+StructuredBuffer<float> _TemperatureField;
+
+RWTexture3D<float4> _FluidVelocityTexture;
+RWTexture3D<float> _FluidPressureTexture;
+RWTexture3D<float> _FluidDensityTexture;
+
+StructuredBuffer<SimulationParams> _SimulationParams;
+
+// Spatial grid data
+StructuredBuffer<int> _SpatialGridCells;
+StructuredBuffer<int> _BalloonToCellMapping;
+
+// Grid parameters
+int3 _GridDimensions;
+float3 _GridOrigin;
+float _CellSize;
+
+// Noise functions for turbulence
+float hash(float3 p)
+{
+    p = frac(p * 0.3183099 + 0.1);
+    p *= 17.0;
+    return frac(p.x * p.y * p.z * (p.x + p.y + p.z));
+}
+
+float noise(float3 x)
+{
+    float3 p = floor(x);
+    float3 f = frac(x);
+    f = f * f * (3.0 - 2.0 * f);
+
+    return lerp(lerp(lerp(hash(p + float3(0, 0, 0)),
+                         hash(p + float3(1, 0, 0)), f.x),
+                     lerp(hash(p + float3(0, 1, 0)),
+                         hash(p + float3(1, 1, 0)), f.x), f.y),
+                lerp(lerp(hash(p + float3(0, 0, 1)),
+                         hash(p + float3(1, 0, 1)), f.x),
+                     lerp(hash(p + float3(0, 1, 1)),
+                         hash(p + float3(1, 1, 1)), f.x), f.y), f.z);
+}
+
+float3 curlNoise(float3 p)
+{
+    const float eps = 0.1;
+    float n1 = noise(p + float3(0, eps, 0));
+    float n2 = noise(p - float3(0, eps, 0));
+    float n3 = noise(p + float3(0, 0, eps));
+    float n4 = noise(p - float3(0, 0, eps));
+    float n5 = noise(p + float3(eps, 0, 0));
+    float n6 = noise(p - float3(eps, 0, 0));
+    
+    float3 curl;
+    curl.x = (n1 - n2 - n3 + n4) / (2.0 * eps);
+    curl.y = (n3 - n4 - n5 + n6) / (2.0 * eps);
+    curl.z = (n5 - n6 - n1 + n2) / (2.0 * eps);
+    
+    return curl;
+}
+
+// Utility functions
+float3 sampleFluidVelocity(float3 position, SimulationParams params)
+{
+    float3 gridPos = (position - _GridOrigin) / _CellSize;
+    int3 gridCoord = int3(gridPos);
+    
+    if (any(gridCoord < 0) || any(gridCoord >= _GridDimensions))
+        return params.windDirection * params.windStrength;
+    
+    int gridIndex = gridCoord.x + gridCoord.y * _GridDimensions.x + gridCoord.z * _GridDimensions.x * _GridDimensions.y;
+    return _VelocityField[gridIndex];
+}
+
+float sampleFluidPressure(float3 position)
+{
+    float3 gridPos = (position - _GridOrigin) / _CellSize;
+    int3 gridCoord = int3(gridPos);
+    
+    if (any(gridCoord < 0) || any(gridCoord >= _GridDimensions))
+        return 101325.0; // Atmospheric pressure
+    
+    int gridIndex = gridCoord.x + gridCoord.y * _GridDimensions.x + gridCoord.z * _GridDimensions.x * _GridDimensions.y;
+    return _PressureField[gridIndex];
+}
+
+// Physics kernels
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void UpdatePhysics(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_SimulationParams[0].maxBalloonCount)
+        return;
+    
+    int balloonIndex = _ActiveIndicesBuffer[id.x];
+    if (balloonIndex < 0 || balloonIndex >= _SimulationParams[0].maxBalloonCount)
+        return;
+    
+    BalloonData balloon = _BalloonBuffer[balloonIndex];
+    SimulationParams params = _SimulationParams[0];
+    
+    // Skip destroyed balloons
+    if (balloon.state == 3)
+        return;
+    
+    // Reset acceleration
+    balloon.acceleration = float3(0, 0, 0);
+    
+    // 1. Gravity
+    balloon.acceleration.y += params.gravity;
+    
+    // 2. Buoyancy
+    float effectiveBuoyancy = balloon.buoyancy;
+    // Temperature and altitude effects
+    float altitudeFactor = exp(-params.altitude * 0.00012);
+    float temperatureFactor = 288.15 / (params.temperature + 273.15);
+    effectiveBuoyancy *= altitudeFactor * temperatureFactor;
+    balloon.acceleration.y += effectiveBuoyancy * abs(params.gravity);
+    
+    // 3. Wind force
+    float3 windForce = params.windDirection * params.windStrength * 0.1;
+    balloon.acceleration += windForce;
+    
+    // 4. Drag force
+    float3 relativeVelocity = balloon.velocity - sampleFluidVelocity(balloon.position, params);
+    float speed = length(relativeVelocity);
+    if (speed > 0.001)
+    {
+        float3 dragDirection = -normalize(relativeVelocity);
+        float area = PI * balloon.radius * balloon.radius;
+        float dragForce = 0.5 * params.airDensity * speed * speed * params.dragCoefficient * area;
+        balloon.acceleration += dragDirection * dragForce / balloon.mass;
+    }
+    
+    // 5. Turbulence
+    float3 turbulence = curlNoise(balloon.position * 0.1 + params.time * 0.1) * params.turbulenceStrength;
+    balloon.acceleration += turbulence;
+    
+    // 6. Boundary forces
+    float3 center = (params.worldBoundsMin + params.worldBoundsMax) * 0.5;
+    float3 extents = (params.worldBoundsMax - params.worldBoundsMin) * 0.5;
+    float3 relativePos = balloon.position - center;
+    float3 distances = extents - abs(relativePos);
+    
+    float boundaryThickness = 5.0;
+    if (distances.x < boundaryThickness)
+    {
+        float strength = 1.0 - (distances.x / boundaryThickness);
+        balloon.acceleration.x += sign(relativePos.x) * -strength * 10.0;
+    }
+    if (distances.y < boundaryThickness)
+    {
+        float strength = 1.0 - (distances.y / boundaryThickness);
+        balloon.acceleration.y += sign(relativePos.y) * -strength * 10.0;
+    }
+    if (distances.z < boundaryThickness)
+    {
+        float strength = 1.0 - (distances.z / boundaryThickness);
+        balloon.acceleration.z += sign(relativePos.z) * -strength * 10.0;
+    }
+    
+    // Integrate velocity and position
+    balloon.velocity += balloon.acceleration * params.deltaTime;
+    balloon.velocity *= params.damping;
+    balloon.position += balloon.velocity * params.deltaTime;
+    
+    // Update age
+    balloon.age += params.deltaTime;
+    
+    // Update distance to camera for LOD
+    balloon.distanceToCamera = distance(balloon.position, params.cameraPosition);
+    
+    // Update LOD level
+    if (balloon.distanceToCamera < params.lodDistanceThreshold * 0.5)
+        balloon.lodLevel = 0; // High detail
+    else if (balloon.distanceToCamera < params.lodDistanceThreshold)
+        balloon.lodLevel = 1; // Medium detail
+    else
+        balloon.lodLevel = 2; // Low detail
+    
+    _BalloonBuffer[balloonIndex] = balloon;
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void UpdateDeformation(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_SimulationParams[0].maxBalloonCount)
+        return;
+    
+    int balloonIndex = _ActiveIndicesBuffer[id.x];
+    if (balloonIndex < 0 || balloonIndex >= _SimulationParams[0].maxBalloonCount)
+        return;
+    
+    BalloonData balloon = _BalloonBuffer[balloonIndex];
+    SimulationParams params = _SimulationParams[0];
+    
+    if (balloon.state == 3) // Destroyed
+        return;
+    
+    // Velocity-based deformation
+    float speed = length(balloon.velocity);
+    if (speed > 0.1)
+    {
+        float3 velocityDir = normalize(balloon.velocity);
+        float dragDeformation = speed * params.dragCoefficient * 0.01;
+        dragDeformation = min(dragDeformation, 0.3);
+        
+        // Create stretch matrix along velocity direction
+        float stretch = 1.0 + dragDeformation;
+        float compress = 1.0 - dragDeformation * 0.5;
+        
+        // Simple deformation matrix (stretch in velocity direction)
+        balloon.deformationMatrix._11 = lerp(1.0, stretch, abs(velocityDir.x));
+        balloon.deformationMatrix._22 = lerp(1.0, compress, 1.0 - abs(velocityDir.y));
+        balloon.deformationMatrix._33 = lerp(1.0, compress, 1.0 - abs(velocityDir.z));
+    }
+    
+    // Pressure-based deformation
+    float pressureDiff = balloon.internalPressure - 101325.0;
+    float normalizedPressure = pressureDiff / 101325.0;
+    float pressureScale = 1.0 + normalizedPressure * 0.1;
+    pressureScale = clamp(pressureScale, 0.8, 1.3);
+    
+    // Apply uniform scaling
+    balloon.deformationMatrix._11 *= pressureScale;
+    balloon.deformationMatrix._22 *= pressureScale;
+    balloon.deformationMatrix._33 *= pressureScale;
+    
+    // Elastic recovery
+    float recoverySpeed = balloon.elasticity * 2.0;
+    balloon.deformationMatrix._11 = lerp(balloon.deformationMatrix._11, 1.0, params.deltaTime * recoverySpeed);
+    balloon.deformationMatrix._22 = lerp(balloon.deformationMatrix._22, 1.0, params.deltaTime * recoverySpeed);
+    balloon.deformationMatrix._33 = lerp(balloon.deformationMatrix._33, 1.0, params.deltaTime * recoverySpeed);
+    
+    // Check for bursting
+    float deformationAmount = abs(balloon.deformationMatrix._11 - 1.0) + 
+                             abs(balloon.deformationMatrix._22 - 1.0) + 
+                             abs(balloon.deformationMatrix._33 - 1.0);
+    
+    if (deformationAmount > 1.0 / balloon.elasticity)
+    {
+        balloon.state = 2; // Bursting
+        balloon.health -= params.deltaTime * 2.0;
+        
+        if (balloon.health <= 0.0)
+        {
+            balloon.state = 3; // Destroyed
+        }
+    }
+    
+    _BalloonBuffer[balloonIndex] = balloon;
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void UpdateFluidDynamics(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_SimulationParams[0].maxBalloonCount)
+        return;
+    
+    int balloonIndex = _ActiveIndicesBuffer[id.x];
+    if (balloonIndex < 0 || balloonIndex >= _SimulationParams[0].maxBalloonCount)
+        return;
+    
+    BalloonData balloon = _BalloonBuffer[balloonIndex];
+    SimulationParams params = _SimulationParams[0];
+    
+    if (balloon.state == 3)
+        return;
+    
+    // Sample fluid properties
+    float3 fluidVelocity = sampleFluidVelocity(balloon.position, params);
+    float pressure = sampleFluidPressure(balloon.position);
+    
+    // Calculate relative velocity
+    float3 relativeVelocity = balloon.velocity - fluidVelocity;
+    float reynoldsNumber = params.airDensity * length(relativeVelocity) * (2.0 * balloon.radius) / params.viscosityCoefficient;
+    
+    // Drag coefficient based on Reynolds number
+    float dragCoeff;
+    if (reynoldsNumber < 1.0)
+        dragCoeff = 24.0 / reynoldsNumber; // Stokes flow
+    else if (reynoldsNumber < 1000.0)
+        dragCoeff = 24.0 / reynoldsNumber * (1.0 + 0.15 * pow(reynoldsNumber, 0.687));
+    else
+        dragCoeff = params.dragCoefficient; // Turbulent
+    
+    // Apply fluid forces
+    if (length(relativeVelocity) > 0.001)
+    {
+        float3 dragDirection = -normalize(relativeVelocity);
+        float area = PI * balloon.radius * balloon.radius;
+        float speed = length(relativeVelocity);
+        float dragMagnitude = 0.5 * params.airDensity * speed * speed * dragCoeff * area;
+        balloon.acceleration += dragDirection * dragMagnitude / balloon.mass;
+    }
+    
+    // Magnus effect for spinning balloons
+    if (length(balloon.angularVelocity) > 0.001)
+    {
+        float volume = (4.0 / 3.0) * PI * balloon.radius * balloon.radius * balloon.radius;
+        float3 magnusForce = params.airDensity * volume * cross(balloon.angularVelocity, balloon.velocity);
+        balloon.acceleration += magnusForce / balloon.mass;
+    }
+    
+    // Vortex shedding
+    float speed = length(balloon.velocity);
+    if (speed > 0.1)
+    {
+        float strouhalNumber = 0.2;
+        float sheddingFrequency = strouhalNumber * speed / (2.0 * balloon.radius);
+        
+        float3 flowDirection = normalize(balloon.velocity);
+        float3 perpendicular = normalize(cross(flowDirection, float3(0, 1, 0)));
+        if (length(perpendicular) < 0.001)
+            perpendicular = normalize(cross(flowDirection, float3(1, 0, 0)));
+        
+        float vortexStrength = sin(2.0 * PI * sheddingFrequency * params.time);
+        balloon.acceleration += perpendicular * vortexStrength * params.vortexStrength * speed / balloon.mass;
+    }
+    
+    _BalloonBuffer[balloonIndex] = balloon;
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void UpdateSwarmBehavior(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_SimulationParams[0].maxBalloonCount)
+        return;
+    
+    int balloonIndex = _ActiveIndicesBuffer[id.x];
+    if (balloonIndex < 0 || balloonIndex >= _SimulationParams[0].maxBalloonCount)
+        return;
+    
+    BalloonData balloon = _BalloonBuffer[balloonIndex];
+    SimulationParams params = _SimulationParams[0];
+    
+    if (balloon.state == 3)
+        return;
+    
+    // Simple flocking behavior
+    float3 separation = float3(0, 0, 0);
+    float3 alignment = float3(0, 0, 0);
+    float3 cohesion = float3(0, 0, 0);
+    int neighborCount = 0;
+    
+    float neighborRadius = 5.0;
+    
+    // Check nearby balloons (simplified - check all for now)
+    for (int i = 0; i < min(100, _SimulationParams[0].maxBalloonCount); i++)
+    {
+        if (i == balloonIndex)
+            continue;
+        
+        BalloonData neighbor = _BalloonBuffer[i];
+        if (neighbor.state == 3)
+            continue;
+        
+        float3 diff = balloon.position - neighbor.position;
+        float distance = length(diff);
+        
+        if (distance < neighborRadius && distance > 0.001)
+        {
+            // Separation
+            separation += normalize(diff) / distance;
+            
+            // Alignment
+            alignment += neighbor.velocity;
+            
+            // Cohesion
+            cohesion += neighbor.position;
+            
+            neighborCount++;
+        }
+    }
+    
+    if (neighborCount > 0)
+    {
+        // Average the forces
+        separation /= neighborCount;
+        alignment /= neighborCount;
+        cohesion /= neighborCount;
+        
+        // Apply separation (avoid crowding)
+        balloon.acceleration += separation * 2.0;
+        
+        // Apply alignment (match velocity)
+        float3 desiredVelocity = alignment;
+        float3 steer = desiredVelocity - balloon.velocity;
+        balloon.acceleration += steer * 0.5;
+        
+        // Apply cohesion (move toward center)
+        float3 toCenter = cohesion - balloon.position;
+        if (length(toCenter) > 0.001)
+        {
+            balloon.acceleration += normalize(toCenter) * 0.3;
+        }
+    }
+    
+    _BalloonBuffer[balloonIndex] = balloon;
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void UpdateTransformMatrices(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_SimulationParams[0].maxBalloonCount)
+        return;
+    
+    int balloonIndex = _ActiveIndicesBuffer[id.x];
+    if (balloonIndex < 0 || balloonIndex >= _SimulationParams[0].maxBalloonCount)
+        return;
+    
+    BalloonData balloon = _BalloonBuffer[balloonIndex];
+    
+    if (balloon.state == 3) // Skip destroyed balloons
+        return;
+    
+    // Create transform matrix
+    float scale = balloon.radius * 2.0;
+    float4x4 scaleMatrix = float4x4(
+        scale, 0, 0, 0,
+        0, scale, 0, 0,
+        0, 0, scale, 0,
+        0, 0, 0, 1
+    );
+    
+    // Apply deformation
+    float4x4 transform = mul(scaleMatrix, balloon.deformationMatrix);
+    
+    // Apply translation
+    transform._14 = balloon.position.x;
+    transform._24 = balloon.position.y;
+    transform._34 = balloon.position.z;
+    
+    // Store transform matrix
+    balloon.transformMatrix = transform;
+    _BalloonBuffer[balloonIndex] = balloon;
+    
+    // Update rendering buffers
+    _TransformBuffer[balloonIndex] = transform;
+    _ColorBuffer[balloonIndex] = balloon.baseColor;
+    _MaterialPropertyBuffer[balloonIndex] = float4(balloon.metallic, balloon.roughness, balloon.transparency, balloon.lodLevel);
+}
