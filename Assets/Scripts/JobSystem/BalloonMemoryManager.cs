@@ -414,10 +414,17 @@ namespace BalloonSimulation.JobSystem
             {
                 unsafe
                 {
-                    var ptr = new IntPtr(balloonDataArray.GetUnsafePtr());
-                    if (!activeAllocations.ContainsKey(ptr))
+                    try
                     {
-                        Debug.LogWarning("[BalloonMemoryManager] Untracked allocation detected for balloon data array");
+                        var ptr = new IntPtr(balloonDataArray.GetUnsafePtr());
+                        if (!activeAllocations.ContainsKey(ptr))
+                        {
+                            Debug.LogWarning("[BalloonMemoryManager] Untracked allocation detected for balloon data array");
+                        }
+                    }
+                    catch (System.InvalidOperationException)
+                    {
+                        Debug.LogWarning("[BalloonMemoryManager] Could not validate balloon data array - array may be disposed");
                     }
                 }
             }
@@ -620,7 +627,7 @@ namespace BalloonSimulation.JobSystem
     }
     
     /// <summary>
-    /// Generic NativeArray pooling system for efficient memory reuse
+    /// Generic NativeArray pooling system for efficient memory reuse with thread safety
     /// </summary>
     public class NativeArrayPool<T> : IDisposable where T : struct
     {
@@ -628,11 +635,63 @@ namespace BalloonSimulation.JobSystem
         private readonly HashSet<NativeArray<T>> activeArrays;
         private readonly int maxPoolSize;
         private readonly Allocator allocator;
+        private readonly object poolLock = new object();
         
-        public int ActiveCount => activeArrays.Count;
-        public int AvailableCount => availableArrays.Count;
-        public bool HasLeaks => activeArrays.Count > maxPoolSize * 2;
-        public long EstimatedSize => (activeArrays.Count + availableArrays.Count) * UnsafeUtility.SizeOf<T>() * 100; // Estimate
+        public int ActiveCount 
+        { 
+            get 
+            { 
+                lock (poolLock) 
+                { 
+                    return activeArrays.Count; 
+                } 
+            } 
+        }
+        
+        public int AvailableCount 
+        { 
+            get 
+            { 
+                lock (poolLock) 
+                { 
+                    return availableArrays.Count; 
+                } 
+            } 
+        }
+        
+        public bool HasLeaks 
+        { 
+            get 
+            { 
+                lock (poolLock) 
+                { 
+                    return activeArrays.Count > maxPoolSize * 2; 
+                } 
+            } 
+        }
+        
+        public long EstimatedSize 
+        { 
+            get 
+            { 
+                lock (poolLock) 
+                { 
+                    // Calculate actual size based on tracked arrays instead of hardcoded estimate
+                    long totalSize = 0;
+                    foreach (var array in activeArrays)
+                    {
+                        if (array.IsCreated)
+                            totalSize += array.Length * UnsafeUtility.SizeOf<T>();
+                    }
+                    foreach (var array in availableArrays)
+                    {
+                        if (array.IsCreated)
+                            totalSize += array.Length * UnsafeUtility.SizeOf<T>();
+                    }
+                    return totalSize;
+                } 
+            } 
+        }
         
         public NativeArrayPool(int maxSize = 100, Allocator allocator = Allocator.Persistent)
         {
@@ -643,110 +702,127 @@ namespace BalloonSimulation.JobSystem
         }
         
         /// <summary>
-        /// Gets a pooled array of the specified size
+        /// Gets a pooled array of the specified size (thread-safe)
         /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public NativeArray<T> Get(int size)
         {
-            // Try to find a suitable array from the pool
-            while (availableArrays.Count > 0)
+            lock (poolLock)
             {
-                var array = availableArrays.Dequeue();
-                if (array.IsCreated && array.Length >= size)
+                // Try to find a suitable array from the pool
+                while (availableArrays.Count > 0)
                 {
-                    activeArrays.Add(array);
-                    return array.GetSubArray(0, size);
+                    var array = availableArrays.Dequeue();
+                    if (array.IsCreated && array.Length >= size)
+                    {
+                        activeArrays.Add(array);
+                        return array.GetSubArray(0, size);
+                    }
+                    else if (array.IsCreated)
+                    {
+                        array.Dispose();
+                    }
                 }
-                else if (array.IsCreated)
-                {
-                    array.Dispose();
-                }
+                
+                // Create new array if pool is empty
+                var newArray = new NativeArray<T>(size, allocator);
+                activeArrays.Add(newArray);
+                return newArray;
             }
-            
-            // Create new array if pool is empty
-            var newArray = new NativeArray<T>(size, allocator);
-            activeArrays.Add(newArray);
-            return newArray;
         }
         
         /// <summary>
-        /// Returns an array to the pool
+        /// Returns an array to the pool (thread-safe)
         /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void Return(NativeArray<T> array)
         {
             if (!array.IsCreated) return;
             
-            if (activeArrays.Remove(array))
+            lock (poolLock)
             {
-                if (availableArrays.Count < maxPoolSize)
+                if (activeArrays.Remove(array))
                 {
-                    availableArrays.Enqueue(array);
-                }
-                else
-                {
-                    array.Dispose();
+                    if (availableArrays.Count < maxPoolSize)
+                    {
+                        availableArrays.Enqueue(array);
+                    }
+                    else
+                    {
+                        array.Dispose();
+                    }
                 }
             }
         }
         
         /// <summary>
-        /// Cleans up unused arrays in the pool
+        /// Cleans up unused arrays in the pool (thread-safe)
         /// </summary>
         public void Cleanup()
         {
-            // Remove half of the available arrays to free memory
-            int toRemove = availableArrays.Count / 2;
-            for (int i = 0; i < toRemove; i++)
+            lock (poolLock)
             {
-                if (availableArrays.Count > 0)
+                // Remove half of the available arrays to free memory
+                int toRemove = availableArrays.Count / POOL_CLEANUP_RATIO;
+                for (int i = 0; i < toRemove; i++)
+                {
+                    if (availableArrays.Count > 0)
+                    {
+                        var array = availableArrays.Dequeue();
+                        if (array.IsCreated)
+                            array.Dispose();
+                    }
+                }
+            }
+        }
+        
+        /// <summary>
+        /// Forces cleanup of all arrays (for leak repair, thread-safe)
+        /// </summary>
+        public void ForceCleanup()
+        {
+            lock (poolLock)
+            {
+                // Dispose all available arrays
+                while (availableArrays.Count > 0)
                 {
                     var array = availableArrays.Dequeue();
                     if (array.IsCreated)
                         array.Dispose();
                 }
+                
+                // Log active arrays that might be leaked
+                if (activeArrays.Count > 0)
+                {
+                    Debug.LogWarning($"[NativeArrayPool<{typeof(T).Name}>] {activeArrays.Count} arrays still active during force cleanup");
+                }
             }
         }
         
         /// <summary>
-        /// Forces cleanup of all arrays (for leak repair)
-        /// </summary>
-        public void ForceCleanup()
-        {
-            // Dispose all available arrays
-            while (availableArrays.Count > 0)
-            {
-                var array = availableArrays.Dequeue();
-                if (array.IsCreated)
-                    array.Dispose();
-            }
-            
-            // Log active arrays that might be leaked
-            if (activeArrays.Count > 0)
-            {
-                Debug.LogWarning($"[NativeArrayPool<{typeof(T).Name}>] {activeArrays.Count} arrays still active during force cleanup");
-            }
-        }
-        
-        /// <summary>
-        /// Disposes the entire pool
+        /// Disposes the entire pool (thread-safe)
         /// </summary>
         public void Dispose()
         {
-            // Dispose all available arrays
-            while (availableArrays.Count > 0)
+            lock (poolLock)
             {
-                var array = availableArrays.Dequeue();
-                if (array.IsCreated)
-                    array.Dispose();
+                // Dispose all available arrays
+                while (availableArrays.Count > 0)
+                {
+                    var array = availableArrays.Dequeue();
+                    if (array.IsCreated)
+                        array.Dispose();
+                }
+                
+                // Dispose all active arrays
+                foreach (var array in activeArrays)
+                {
+                    if (array.IsCreated)
+                        array.Dispose();
+                }
+                
+                activeArrays.Clear();
             }
-            
-            // Dispose all active arrays
-            foreach (var array in activeArrays)
-            {
-                if (array.IsCreated)
-                    array.Dispose();
-            }
-            
-            activeArrays.Clear();
         }
     }
     
