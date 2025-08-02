@@ -162,7 +162,7 @@ namespace BalloonSimulation.Editor
             camera.nearClipPlane = 0.3f;
             
             // Add camera controller
-            cameraObj.AddComponent<FreeLookCamera>();
+            cameraObj.AddComponent<BalloonFreeLookCamera>();
             
             // Create Lighting
             SetupLighting(worldSize);
