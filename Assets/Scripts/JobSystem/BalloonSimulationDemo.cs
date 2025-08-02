@@ -46,10 +46,10 @@ namespace BalloonSimulation.JobSystem
             mainCamera.farClipPlane = 200;
             
             // Add camera controller
-            FreeLookCamera cameraController = mainCamera.GetComponent<FreeLookCamera>();
+            SimpleDemoCamera cameraController = mainCamera.GetComponent<SimpleDemoCamera>();
             if (cameraController == null)
             {
-                cameraController = mainCamera.gameObject.AddComponent<FreeLookCamera>();
+                cameraController = mainCamera.gameObject.AddComponent<SimpleDemoCamera>();
             }
             
             // Set up lighting
@@ -125,7 +125,7 @@ namespace BalloonSimulation.JobSystem
     /// <summary>
     /// Simple free look camera controller
     /// </summary>
-    public class FreeLookCamera : MonoBehaviour
+    public class SimpleDemoCamera : MonoBehaviour
     {
         [Header("Movement")]
         public float moveSpeed = 20f;

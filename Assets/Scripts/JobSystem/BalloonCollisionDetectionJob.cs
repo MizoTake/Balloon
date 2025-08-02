@@ -52,13 +52,7 @@ namespace BalloonSimulation.JobSystem
                                         
                                         if (distance < minDistance && distance > 0.0001f)
                                         {
-                                            collisionPairs.Add(new CollisionPair
-                                            {
-                                                indexA = i,
-                                                indexB = neighborIndex,
-                                                distance = distance,
-                                                minDistance = minDistance
-                                            });
+                                            collisionPairs.Add(CollisionPair.Create(i, neighborIndex, distance, minDistance));
                                         }
                                     }
                                 }
@@ -129,14 +123,4 @@ namespace BalloonSimulation.JobSystem
         }
     }
     
-    /// <summary>
-    /// Collision pair data
-    /// </summary>
-    public struct CollisionPair
-    {
-        public int indexA;
-        public int indexB;
-        public float distance;
-        public float minDistance;
-    }
 }

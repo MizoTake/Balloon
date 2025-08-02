@@ -13,6 +13,7 @@ namespace BalloonSimulation.JobSystem
     {
         [Header("Simulation Settings")]
         [SerializeField] private int balloonCount = 1000;
+        public int BalloonCount => balloonCount;
         [SerializeField] public SimulationParameters simulationParameters;
         
         [Header("Rendering")]
@@ -33,6 +34,9 @@ namespace BalloonSimulation.JobSystem
         // Systems
         private BalloonRenderingSystem renderingSystem;
         private SpatialHashGrid spatialGrid;
+        private BalloonLODSystem lodSystem;
+        private PerformanceProfiler performanceProfiler;
+        private PhysicsOptimizer physicsOptimizer;
         
         // Job handles
         private JobHandle physicsJobHandle;
@@ -90,6 +94,28 @@ namespace BalloonSimulation.JobSystem
             // Create rendering system
             renderingSystem = new BalloonRenderingSystem(balloonMesh, balloonMaterial, balloonCount);
             renderingSystem.UpdateBounds(simulationParameters.worldBounds);
+            
+            // Create LOD system
+            lodSystem = GetComponent<BalloonLODSystem>();
+            if (lodSystem == null)
+            {
+                lodSystem = gameObject.AddComponent<BalloonLODSystem>();
+            }
+            lodSystem.Initialize(balloonCount);
+            
+            // Create performance profiler
+            performanceProfiler = GetComponent<PerformanceProfiler>();
+            if (performanceProfiler == null)
+            {
+                performanceProfiler = gameObject.AddComponent<PerformanceProfiler>();
+            }
+            
+            // Create physics optimizer
+            physicsOptimizer = GetComponent<PhysicsOptimizer>();
+            if (physicsOptimizer == null)
+            {
+                physicsOptimizer = gameObject.AddComponent<PhysicsOptimizer>();
+            }
         }
         
         void CollectSceneColliders()
@@ -214,6 +240,9 @@ namespace BalloonSimulation.JobSystem
             // Update scene colliders after jobs are complete
             CollectSceneColliders();
             
+            // Update LOD levels
+            var lodHandle = lodSystem.UpdateLODs(balloons, default);
+            
             // Schedule spatial hash rebuild
             var buildHashJob = new BuildSpatialHashJob
             {
@@ -221,15 +250,17 @@ namespace BalloonSimulation.JobSystem
                 grid = spatialGrid,
                 spatialHash = spatialHash
             };
-            var buildHashHandle = buildHashJob.Schedule();
+            var buildHashHandle = buildHashJob.Schedule(lodHandle);
             
-            // Schedule physics job
-            var physicsJob = new BalloonPhysicsJob
+            // Schedule physics job with LOD support
+            var physicsJob = new BalloonPhysicsLODJob
             {
                 balloons = balloons,
                 parameters = simulationParameters,
                 deltaTime = deltaTime,
-                time = time
+                time = time,
+                lodLevels = lodSystem.GetLODArray(),
+                physicsEnabled = lodSystem.GetPhysicsEnabledArray()
             };
             physicsJobHandle = physicsJob.Schedule(balloonCount, innerLoopBatchCount, buildHashHandle);
             
@@ -327,6 +358,16 @@ namespace BalloonSimulation.JobSystem
                 ChangeBalloonCount(Mathf.Max(balloonCount - 500, 100));
             }
             
+            // Reset camera
+            if (Input.GetKeyDown(KeyCode.C))
+            {
+                var freeLookCamera = Camera.main?.GetComponent<BalloonFreeLookCamera>();
+                if (freeLookCamera != null)
+                {
+                    freeLookCamera.ResetCamera();
+                    Debug.Log("Camera reset");
+                }
+            }
         }
         
         void ResetSimulation()
@@ -352,6 +393,10 @@ namespace BalloonSimulation.JobSystem
             // Update count and reinitialize
             balloonCount = newCount;
             InitializeSimulation();
+            
+            // Re-initialize LOD system
+            if (lodSystem != null)
+                lodSystem.Initialize(balloonCount);
             
             Debug.Log($"Balloon count changed to: {balloonCount}");
         }
@@ -381,14 +426,21 @@ namespace BalloonSimulation.JobSystem
         
         string GetPerformanceText()
         {
+            string lodStats = lodSystem != null ? "\n" + lodSystem.GetStatistics() : "";
+            
             return $"Balloons: {balloonCount}\n" +
                    $"FPS: {averageFPS:F1}\n" +
                    $"Physics: {Time.fixedDeltaTime * 1000f:F1}ms\n" +
+                   $"Scene Colliders: {(sceneColliders.IsCreated ? sceneColliders.Length : 0)}" +
+                   lodStats + "\n\n" +
                    $"Controls:\n" +
                    $"  R - Reset\n" +
                    $"  W - Toggle Wind\n" +
                    $"  +/- Change Count\n" +
-                   $"Scene Colliders: {(sceneColliders.IsCreated ? sceneColliders.Length : 0)}";
+                   $"  C - Reset Camera\n" +
+                   $"  F1 - Toggle Stats\n" +
+                   $"  WASD/QE - Move\n" +
+                   $"  Right Click - Look";
         }
         
         void OnDestroy()
@@ -404,6 +456,32 @@ namespace BalloonSimulation.JobSystem
             
             // Dispose rendering system
             renderingSystem?.Dispose();
+        }
+        
+        /// <summary>
+        /// Get a copy of current balloon data for external systems
+        /// </summary>
+        public bool TryGetBalloonData(out NativeArray<BalloonData> balloonData)
+        {
+            if (balloons.IsCreated)
+            {
+                balloonData = balloons;
+                return true;
+            }
+            balloonData = default;
+            return false;
+        }
+        
+        /// <summary>
+        /// Update balloon data from external systems (e.g., teleportation)
+        /// </summary>
+        public void UpdateBalloonData(NativeArray<BalloonData> updatedBalloons)
+        {
+            if (balloons.IsCreated && updatedBalloons.Length == balloons.Length)
+            {
+                CompleteJobs();
+                updatedBalloons.CopyTo(balloons);
+            }
         }
     }
     
